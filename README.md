@@ -12,16 +12,16 @@ Pi coding agent 확장. 더 강한 리뷰어 모델(Claude Code CLI)에게 2차 
 ## 설치
 
 ```bash
-pi install git:github.com/<user>/pi-claude-advisor
+pi install git:github.com/heavyrisem/pi-claude-advisor
 ```
 
 프로젝트 로컬만:
 
 ```bash
-pi install git:github.com/<user>/pi-claude-advisor -l
+pi install git:github.com/heavyrisem/pi-claude-advisor -l
 ```
 
-갱신: `pi update git:github.com/<user>/pi-claude-advisor` (전체는 `pi update --extensions`)
+갱신: `pi update git:github.com/heavyrisem/pi-claude-advisor` (전체는 `pi update --extensions`)
 
 ## 요구 사항
 
