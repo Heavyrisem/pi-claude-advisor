@@ -1,0 +1,48 @@
+{
+  "name": "pi-claude-advisor",
+  "version": "0.1.0",
+  "description": "Pi coding agent extension: consult a stronger reviewer model (Claude Code CLI) for a second opinion, with an edit/write and repeated-failure gate.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "advisor",
+    "code-review"
+  ],
+  "pi": {
+    "extensions": [
+      "./advisor.ts"
+    ]
+  },
+  "files": [
+    "advisor.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pi:dev": "${PI_BIN:-pi} --no-extensions -e ./advisor.ts",
+    "pi:install-local": "${PI_BIN:-pi} install ./ -l"
+  },
+  "dependencies": {
+    "typebox": "^1.1.38"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.87.0",
+    "@earendil-works/pi-coding-agent": ">=0.87.0",
+    "@earendil-works/pi-tui": ">=0.87.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.87.0",
+    "@earendil-works/pi-coding-agent": "^0.87.0",
+    "@earendil-works/pi-tui": "^0.87.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
