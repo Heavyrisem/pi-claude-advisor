@@ -362,12 +362,12 @@ function runClaude(payload: string, model: string, cwd: string, signal: AbortSig
 
 const GATE_ENABLED = process.env.PI_ADVISOR_GATE !== "0";
 const GATED_TOOLS = new Set(["edit", "write"]);
-// Goal-agnostic failure counter: every failed tool result counts, regardless of
-// method/API/error text — reclassifying failures as "different cause" is
-// exactly what the counter must not depend on. Only an advisor call (or a new
-// session) resets it.
+// Goal-agnostic consecutive-failure counter: every failed tool result counts,
+// regardless of method/API/error text — reclassifying failures as "different
+// cause" is exactly what the counter must not depend on. A successful tool
+// result resets the streak; so do an advisor call, a new prompt, and a new session.
 const FAIL_WARN_AT = 2; // append a warning to the failing tool result
-const FAIL_BLOCK_AT = 3; // block the next tool call until advisor is consulted
+const FAIL_BLOCK_AT = 2; // block the next tool call until advisor is consulted
 const GATE_MARK = "[advisor-gate]";
 
 export default function (pi: ExtensionAPI) {
@@ -375,68 +375,100 @@ export default function (pi: ExtensionAPI) {
   const hasAdvisor = () => pi.getActiveTools().includes("advisor");
   // per conversation — matches "first edit or write in this conversation"
   let consulted = false;
-  let failedSinceAdvisor = 0;
-  // per prompt — each gate may block at most once per prompt, so a refusing
-  // model cannot deadlock.
+  let consecutiveFailures = 0;
+  // per prompt — each gate blocks at most once per streak: the retry gate
+  // re-arms on a success reset, both gates on a new prompt. Advisor calls are
+  // never blocked, so a refusing model cannot deadlock.
   // BUGFIX: previously a single `consulted` flag was flipped when blocking,
   // which disabled the edit/write gate for the rest of the conversation even
   // though advisor was never actually called.
   let blockedEditThisPrompt = false;
   let blockedRetryThisPrompt = false;
+  // call ids the gate blocked in tool_call; their tool_results are the gate
+  // talking to the model — excluded by id in tool_result (marker string
+  // matching would misfire on `read advisor.ts` / `grep advisor-gate` output)
+  const blockedCallIds = new Set<string>();
 
   pi.on("session_start", () => {
     consulted = false;
-    failedSinceAdvisor = 0;
+    consecutiveFailures = 0;
     blockedEditThisPrompt = false;
     blockedRetryThisPrompt = false;
+    blockedCallIds.clear();
   });
 
   pi.on("before_agent_start", (event) => {
+    // a new prompt is a new line of work — the streak does not cross the boundary
+    consecutiveFailures = 0;
     blockedEditThisPrompt = false;
     blockedRetryThisPrompt = false;
+    blockedCallIds.clear();
     if (!hasAdvisor()) return;
     return {
-      systemPrompt: `${event.systemPrompt}\n\nBefore your first edit or write in this conversation, and before telling the user the work is done, call the advisor tool.\n\nFailure escalation: the harness counts tool results with non-zero exit since your last advisor call. Changing method, API, or error text does not reset the counter — only an advisor call does. A failure visible only in output (HTTP 302/4xx in the text, 'Not Found', an error JSON body) still counts as a failure even when the process exits 0 — count those yourself and apply the same threshold (advisor after 2). When a probe's success is the point, encode its result in the exit code (e.g. code=$(curl -s -o out -w '%{http_code}' …); [ "$code" = 200 ]; plain curl -f does not fail on 302) and do not mask exits with pipes lacking pipefail or '|| true'. If you are about to redefine the goal in a way that would lower the counter, submit that redefinition itself to the advisor.`,
+      systemPrompt: `${event.systemPrompt}\n\nBefore your first edit or write in this conversation, and before telling the user the work is done, call the advisor tool.\n\nFailure escalation: the harness counts consecutive tool failures. A successful tool call resets the counter to 0; a new prompt, an advisor call, and a new session do too. Changing method, API, or error text does not reset the counter — only a success (or an advisor call) does. A failure visible only in output (HTTP 302/4xx in the text, 'Not Found', an error JSON body) still counts as a failure even when the process exits 0 — count those yourself and apply the same threshold (advisor after 2 consecutive failures). Do not slip a successful read-only call in just to reset the counter before the advisor call. When a probe's success is the point, encode its result in the exit code (e.g. code=$(curl -s -o out -w '%{http_code}' …); [ "$code" = 200 ]; plain curl -f does not fail on 302) and do not mask exits with pipes lacking pipefail or '|| true'. If you are about to redefine the goal in a way that would lower the counter, submit that redefinition itself to the advisor.`,
     };
   });
 
   pi.on("tool_call", (event) => {
     if (event.toolName === "advisor") {
       consulted = true;
-      failedSinceAdvisor = 0;
+      consecutiveFailures = 0;
+      // an advisor call re-arms the retry block too, matching the "advisor
+      // call resets" promise even when the call itself fails
+      blockedRetryThisPrompt = false;
       return;
     }
     if (!GATE_ENABLED || !hasAdvisor()) return;
     if (!consulted && !blockedEditThisPrompt && GATED_TOOLS.has(event.toolName)) {
       blockedEditThisPrompt = true;
+      blockedCallIds.add(event.toolCallId);
       return {
         block: true,
         reason:
-          "advisor를 먼저 호출하라. task에 지금 하려는 변경과 그 이유를, context에 이미 시도한 것과 실패한 것을, files에 이 결정이 걸린 파일 경로를 담아서. 조언을 받은 뒤 이 수정을 다시 시도하라.",
+          `${GATE_MARK} advisor를 먼저 호출하라. task에 지금 하려는 변경과 그 이유를, context에 이미 시도한 것과 실패한 것을, files에 이 결정이 걸린 파일 경로를 담아서. 조언을 받은 뒤 이 수정을 다시 시도하라.`,
       };
     }
-    if (failedSinceAdvisor >= FAIL_BLOCK_AT && !blockedRetryThisPrompt) {
+    if (consecutiveFailures >= FAIL_BLOCK_AT && !blockedRetryThisPrompt) {
       blockedRetryThisPrompt = true;
+      blockedCallIds.add(event.toolCallId);
       return {
         block: true,
-        reason: `${GATE_MARK} advisor 호출 이후 도구 실패 ${failedSinceAdvisor}회 누적. 같은 목표를 향한 다음 시도를 멈추고 advisor를 호출하라. 방법·API·에러가 달라져도 카운터는 advisor 호출로만 리셋된다. task: 목표 한 문장. context: 시도 목록(명령/에러 원문 그대로)과 각 시도에서 세운 가설, 다음에 하려는 것.`,
+        reason: `${GATE_MARK} 도구 ${consecutiveFailures}회 연속 실패. 같은 목표를 향한 다음 시도를 멈추고 advisor를 호출하라. 방법·API·에러가 달라져도 카운터는 성공한 도구 호출이나 advisor 호출로만 리셋된다. task: 목표 한 문장. context: 시도 목록(명령/에러 원문 그대로)과 각 시도에서 세운 가설, 다음에 하려는 것.`,
       };
     }
   });
 
   pi.on("tool_result", (event) => {
-    if (!GATE_ENABLED || !event.isError || !hasAdvisor()) return;
-    // do not count the gate's own block messages as failures
-    const text = event.content.map((part) => (part.type === "text" ? part.text : "")).join("");
-    if (text.includes(GATE_MARK)) return;
-    failedSinceAdvisor += 1;
-    if (failedSinceAdvisor < FAIL_WARN_AT) return;
+    if (!GATE_ENABLED) return;
+    // results of calls the gate blocked in tool_call are the gate talking to
+    // the model, not real failures — excluded by call id before the success
+    // reset so a block (isError true or false) never touches the counter in
+    // either direction
+    if (blockedCallIds.delete(event.toolCallId)) return;
+    // a success breaks the consecutive-failure streak — that is the whole point
+    // of counting consecutive, not cumulative, failures; a success also
+    // re-arms the once-per-streak block so the next streak warns and blocks
+    if (!event.isError) {
+      consecutiveFailures = 0;
+      blockedRetryThisPrompt = false;
+      return;
+    }
+    if (!hasAdvisor()) return;
+    // advisor's own failures are handled by its tool_call reset; counting them
+    // here would let a dead advisor (missing CLI, timeout) trip the block gate
+    // whose remedy — calling the advisor — is itself broken
+    if (event.toolName === "advisor") return;
+    consecutiveFailures += 1;
+    if (consecutiveFailures < FAIL_WARN_AT) return;
+    // the "next call is blocked" promise is only true while the block is
+    // still armed — don't promise what a consumed block cannot enforce
+    const blockPending = !blockedRetryThisPrompt;
     return {
       content: [
         ...event.content,
         {
           type: "text" as const,
-          text: `${GATE_MARK} advisor 호출 이후 도구 실패 ${failedSinceAdvisor}회 누적. 다음 시도를 시작하기 전에 advisor를 호출하라. "원인이 다르다 / 방법이 바뀌었다"는 판단으로 스킵할 수 없으며, 그 판단 자체를 advisor에게 제출할 내용으로 삼는다.`,
+          text: `${GATE_MARK} 도구 ${consecutiveFailures}회 연속 실패. ${blockPending ? "다음 도구 호출은 advisor를 불러야만 통과한다 — " : ""}지금 advisor를 호출하라. "원인이 다르다 / 방법이 바뀌었다"는 판단으로 스킵할 수 없으며(리셋은 성공한 도구 호출이나 advisor 호출로만), 그 판단 자체를 advisor에게 제출할 내용으로 삼는다.`,
         },
       ],
     }
@@ -458,7 +490,7 @@ Parameters:
 Call advisor when ANY of these is true — no judgement call needed, just check the condition:
 - You are about to call edit or write for the first time in this conversation.
 - You are about to tell the user the work is done, or answer their question as settled.
-- The same error or failure has appeared twice.
+- A tool has failed twice in a row (two consecutive failures).
 - You are about to abandon an approach and start a different one.
 
 Finding files, reading them, and running read-only commands are not covered — do that orientation first, then call advisor with what you found.
@@ -466,7 +498,7 @@ Finding files, reading them, and running read-only commands are not covered — 
 Give the advice serious weight. Adapt only if a step fails empirically or you have primary-source evidence contradicting a specific claim. If your own retrieved data points one way and the advisor points another, do not silently switch — call advisor once more and surface the conflict.`,
     promptSnippet: "Consult a stronger reviewer model on a decision, a blocker, or finished work",
     promptGuidelines: [
-      "Call advisor before the first edit or write, before declaring work done, after the same failure twice, and before switching approach.",
+      "Call advisor before the first edit or write, before declaring work done, after two consecutive tool failures, and before switching approach.",
       "advisor sees nothing but the task, context, and files you pass it — write a self-contained question and name the failed attempts in context.",
     ],
     parameters: Type.Object({
@@ -550,7 +582,7 @@ Give the advice serious weight. Adapt only if a step fails empirically or you ha
       // keep the advice visible collapsed (3 lines) with the usage footer below
       const lines = advice.split("\n");
       const preview = lines.length > 3 ? `${lines.slice(0, 3).join("\n")} …` : advice;
-      return new Text(theme.fg("muted", preview) + `\n${footer} ${keyHint("app.tools.expand", "to expand")}`, 0, 0);
+      return new Text(`${theme.fg("muted", preview)}\n${footer} ${keyHint("app.tools.expand", "to expand")}`, 0, 0);
     },
   });
 }
